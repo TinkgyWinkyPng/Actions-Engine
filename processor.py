@@ -7,8 +7,7 @@ import base64
 import random
 import threading
 import websocket
-import concurrent.futures  # Thư viện quản lý thread
-from datetime import datetime, timezone
+import concurrent.futures
 
 # --- CẤU HÌNH ---
 HEADERS = {
@@ -18,24 +17,19 @@ HEADERS = {
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
 }
 IMAGES_DIR = "Images"
-MAX_WORKERS = 8  # Số lượng thread chạy song song
+MAX_WORKERS = 8 # Chạy song song 10 ảnh cùng lúc
 
-# --- CÁC HÀM XỬ LÝ API (Giữ nguyên logic cũ) ---
-
+# --- HÀM API ---
 def get_signature(prompt):
     url = "https://prompt-signer.freegen.app/"
-    headers = HEADERS.copy()
-    headers["content-type"] = "application/json"
-    response = requests.post(url, headers=headers, json={"prompt": prompt}, timeout=30)
-    return response.json()
+    res = requests.post(url, headers=HEADERS, json={"prompt": prompt}, timeout=30)
+    return res.json()
 
 def start_image_generation(prompt, ts, sig):
     url = "https://image-generator.freegen.app/"
-    headers = HEADERS.copy()
-    headers["content-type"] = "application/json"
     payload = {"prompt": prompt, "ts": ts, "sig": sig, "ratio_id": "16:9"}
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
-    return response.json()
+    res = requests.post(url, headers=HEADERS, json=payload, timeout=30)
+    return res.json()
 
 def save_base64_image(base64_string, filename):
     if "," in base64_string:
@@ -45,11 +39,9 @@ def save_base64_image(base64_string, filename):
 
 class ImageWebsocketClient:
     def __init__(self, job_id, auth_token):
-        self.job_id = job_id
-        self.auth_token = auth_token
+        self.job_id, self.auth_token = job_id, auth_token
         self.ws_url = "wss://websocket-bridge.freegen.app/ws"
-        self.is_completed = False
-        self.image_base64 = None
+        self.is_completed, self.image_base64 = False, None
 
     def on_message(self, ws, message):
         try:
@@ -73,83 +65,61 @@ class ImageWebsocketClient:
         ws.run_forever()
 
 def process_single_prompt(index, prompt):
-    """Hàm xử lý cho một prompt đơn lẻ"""
-    print(f"🎨 [Thread Started] Đang xử lý ảnh {index}...")
+    """Xử lý đơn lẻ cho một prompt"""
+    print(f"🎨 Đang xử lý index {index}...")
     try:
-        # 1. Lấy Signature
         sign_data = get_signature(prompt)
         ts, sig = sign_data["ts"], sign_data["sig"]
         
-        # 2. Tạo Auth Token
-        random_hex = ''.join(random.choices('0123456789abcdef', k=15))
-        auth_prefix = base64.b64encode(random_hex.encode('utf-8')).decode('utf-8')
-        auth_token = f"{auth_prefix}:{ts}"
+        # Tạo token xác thực
+        rand_str = ''.join(random.choices('0123456789abcdef', k=15))
+        auth_token = f"{base64.b64encode(rand_str.encode()).decode()}:{ts}"
         
-        # 3. Gửi lệnh tạo ảnh
         gen_data = start_image_generation(prompt, ts, sig)
         job_id = gen_data.get("job_id")
-        
-        if not job_id:
-            print(f"❌ [Lỗi] Không lấy được job_id cho ảnh {index}")
-            return False
+        if not job_id: return False
 
-        # 4. Chờ qua WebSocket
+        # Chờ ảnh qua Websocket
         ws_client = ImageWebsocketClient(job_id, auth_token)
-        ws_thread = threading.Thread(target=ws_client.connect)
-        ws_thread.start()
+        threading.Thread(target=ws_client.connect).start()
 
-        timeout = 120 # Tăng timeout lên 120s cho chắc chắn
+        timeout = 120
         while not ws_client.is_completed and timeout > 0:
             time.sleep(2)
             timeout -= 2
 
         if ws_client.image_base64:
+            os.makedirs(IMAGES_DIR, exist_ok=True)
             filename = os.path.join(IMAGES_DIR, f"{index}_s1.jpg")
             save_base64_image(ws_client.image_base64, filename)
-            print(f"✅ [Xong] Ảnh {index} đã lưu.")
+            print(f"✅ Đã xong {index}")
             return True
-        else:
-            print(f"❌ [Timeout] Ảnh {index} không phản hồi.")
     except Exception as e:
-        print(f"❌ [Lỗi Hệ Thống] Ảnh {index}: {e}")
+        print(f"❌ Lỗi index {index}: {e}")
     return False
 
-# --- ĐIỀU KHIỂN ĐA LUỒNG ---
-
+# --- ĐIỀU KHIỂN CHÍNH ---
 def main():
-    if len(sys.argv) < 2:
-        print("Thiếu dữ liệu đầu vào.")
-        return
+    if len(sys.argv) < 2: return
+    input_arg = sys.argv[1]
 
-    try:
-        input_data = json.loads(sys.argv[1])
-    except Exception as e:
-        print(f"Lỗi phân giải JSON: {e}")
-        return
+    # Đọc dữ liệu từ file JSON hoặc chuỗi trực tiếp
+    if os.path.exists(input_arg):
+        with open(input_arg, 'r', encoding='utf-8') as f:
+            input_data = json.load(f)
+    else:
+        input_data = json.loads(input_arg)
 
-    if not os.path.exists(IMAGES_DIR):
-        os.makedirs(IMAGES_DIR)
-
-    # Chuyển đổi input_data sang danh sách để ThreadPool dễ xử lý
-    # input_data có dạng {"index": "prompt", ...}
+    # Chuyển đổi sang list để chạy ThreadPool
     tasks = [(idx, p) for idx, p in input_data.items()]
 
-    print(f"🚀 Bắt đầu xử lý Batch với {MAX_WORKERS} threads song song...")
-
-    # Sử dụng ThreadPoolExecutor để quản lý 10 threads
+    print(f"🚀 Bắt đầu Batch với {MAX_WORKERS} luồng...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Gửi tất cả các task vào pool
         futures = {executor.submit(process_single_prompt, idx, p): idx for idx, p in tasks}
-        
-        # Chờ các task hoàn thành
-        for future in concurrent.futures.as_completed(futures):
-            idx = futures[future]
-            try:
-                future.result()
-            except Exception as e:
-                print(f"❌ Thread xử lý ảnh {idx} gặp lỗi nghiêm trọng: {e}")
+        # Đợi tất cả hoàn thành
+        concurrent.futures.wait(futures)
 
-    print("🏁 Batch đã được xử lý xong.")
+    print("🏁 Tất cả prompts trong lượt này đã xong.")
 
 if __name__ == "__main__":
     main()
