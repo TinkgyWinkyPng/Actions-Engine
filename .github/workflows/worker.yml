@@ -30,9 +30,15 @@ jobs:
           pip install requests websocket-client
 
       - name: Run Processor
-        # Truyền JSON vào script Python xử lý
+        shell: bash
         run: |
-          python processor.py '${{ github.event.inputs.batch_data }}'
+          # Sử dụng 'EOF' để bọc dữ liệu giúp tránh lỗi syntax shell khi gặp dấu ngoặc () hoặc nháy kép ""
+          cat << 'EOF' > data.json
+          ${{ github.event.inputs.batch_data }}
+          EOF
+          
+          # Thực thi python và đọc dữ liệu từ file json vừa tạo
+          python processor.py data.json
 
       - name: Clone and Push to Storage Repo
         env:
@@ -42,17 +48,22 @@ jobs:
           git config --global user.name "Github Action Bot"
           git config --global user.email "actions@github.com"
           
-          # Clone repo đích vào thư mục tạm
+          # Clone repo đích
           git clone https://$AUTH_TOKEN@github.com/$TARGET_REPO.git target_storage
           
-          # Tạo thư mục Images nếu chưa có và copy ảnh sang
+          # Tạo thư mục và copy ảnh
           mkdir -p target_storage/Images
-          cp -r Images/* target_storage/Images/
+          if [ -d "Images" ] && [ "$(ls -A Images)" ]; then
+            cp -r Images/* target_storage/Images/
+          else
+            echo "Không có ảnh nào được tạo ra."
+            exit 0
+          fi
           
           cd target_storage
           git add .
           
-          # Chiến lược Retry Push để tránh xung đột khi nhiều Action chạy song song
+          # Chiến lược Push an toàn với Rebase (thử lại 15 lần)
           for i in {1..15}; do
             if git commit -m "Worker auto-saved images"; then
               git pull --rebase origin main
@@ -61,9 +72,9 @@ jobs:
                 exit 0
               fi
             else
-              echo "Không có thay đổi mới để commit."
+              echo "Không có thay đổi mới."
               exit 0
             fi
-            echo "⚠️ Xung đột xảy ra, đang thử lại sau $((RANDOM % 15 + 5)) giây..."
+            echo "⚠️ Đang thử lại sau xung đột..."
             sleep $((RANDOM % 15 + 5))
           done
